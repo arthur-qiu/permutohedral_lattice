@@ -1,0 +1,183 @@
+import tensorflow as tf
+import numpy as np
+import scipy.io
+import os
+import lattice_filter_op_loader
+import cv2
+import matplotlib.pyplot as plt
+from copy import deepcopy
+from scipy.misc import imresize
+from keras.models import Sequential, Model
+from keras.layers import Input, Dense, Conv2D, MaxPooling2D, UpSampling2D
+from keras.layers.core import Activation, Dropout, Flatten, Lambda
+from keras.layers.normalization import BatchNormalization
+from keras.optimizers import SGD, Adam, Nadam
+from keras.utils import np_utils, plot_model
+from keras import objectives, layers
+from keras import backend as K
+
+from os import path
+module = tf.load_op_library(path.join(path.dirname(path.abspath(__file__)), 'lattice_filter.so'))
+
+input_path = 'datasets/night/A'
+output_path = 'datasets/night/B'
+m = 256
+n = 256
+sketch_dim = (m,n,3)
+img_dim = (m,n,3)
+num_images = 2
+num_epochs = 1
+batch_size = 1
+file_names = []
+
+def load_file_names(path):
+    return os.listdir(path)
+
+def sub_plot(x,y,z):
+    fig = plt.figure()
+    a = fig.add_subplot(1,3,1)
+    imgplot = plt.imshow(x, cmap='gray')
+    a.set_title('Sketch')
+    plt.axis("off")
+    a = fig.add_subplot(1,3,2)
+    imgplot = plt.imshow(z)
+    a.set_title('Prediction')
+    plt.axis("off")
+    a = fig.add_subplot(1,3,3)
+    imgplot = plt.imshow(y)
+    a.set_title('Ground Truth')
+    plt.axis("off")
+    plt.show()
+
+def imshow(x, gray=False):
+    plt.imshow(x, cmap='gray' if gray else None)
+    plt.show()
+
+def get_batch(idx, X = True, Y = True):
+    
+    global file_names
+
+    X_train = np.zeros((batch_size, m, n, 3), dtype='float32')
+    Y_train = np.zeros((batch_size, m, n, 3), dtype='float32')
+    F_train = None
+    
+    x_path = input_path
+    y_path = output_path
+    
+    if len(file_names) == 0:
+        file_names = load_file_names(x_path)
+        
+    if X:
+        # Load Sketches
+        for i in range(batch_size):
+            file = os.path.join(x_path, file_names[i+batch_size*idx])
+            img = cv2.imread(file)
+            img = imresize(img, sketch_dim)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img = img.astype('float32')
+            X_train[i] = img / 255.
+            
+    if Y:
+        # Load Ground-truth Images
+        for i in range(batch_size):
+            file = os.path.join(y_path, file_names[i+batch_size*idx])
+            img = cv2.imread(file)
+            img = imresize(img, img_dim)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img = img.astype('float32')
+            Y_train[i] = img / 255.
+    
+    X_train = np.reshape(X_train, (batch_size, m, n, 3))
+    return X_train, Y_train
+
+def pixel_loss(y_true, y_pred):
+    return K.sqrt(K.mean(K.square(y_true - y_pred))) + 0.00001*total_variation_loss(y_pred)
+
+def total_variation_loss(y_pred):
+    if K.image_data_format() == 'channels_first':
+        a = K.square(y_pred[:, :, :m - 1, :n - 1] - y_pred[:, :, 1:, :n - 1])
+        b = K.square(y_pred[:, :, :m - 1, :n - 1] - y_pred[:, :, :m - 1, 1:])
+    else:
+        a = K.square(y_pred[:, :m - 1, :n - 1, :] - y_pred[:, 1:, :n - 1, :])
+        b = K.square(y_pred[:, :m - 1, :n - 1, :] - y_pred[:, :m - 1, 1:, :])
+    return K.sum(K.pow(a + b, 1.25))
+
+def generator_model(input_img):
+    lattice = Lambda(lambda x:module.lattice_filter(x, x, bilateral=True, theta_alpha=8, theta_beta=0.125)) 
+    output = lattice(input_img)
+    return output
+
+def full_model(summary = True):
+    input_img = Input(shape=(m, n, 3))
+    generator = generator_model(input_img)
+    model = Model(input=input_img, output=[generator], name='architect')
+    model.summary()
+    return model
+
+def train_faces(weights=None):
+
+    model = full_model()
+    optim = Adam(lr=1e-4,beta_1=0.9, beta_2=0.999, epsilon=1e-8)
+    model.compile(loss=[pixel_loss], loss_weights=[1], optimizer=optim)
+
+    if weights is not None:
+        model.load_weights(weights)
+    
+    print('start train')
+    for epoch in range(num_epochs):
+        num_batches = num_images // batch_size
+        print('epoch:',epoch)
+
+        for batch in range(num_batches):
+            X,Y = get_batch(batch)
+            loss = model.train_on_batch(X, [Y])
+            print("Loss in Epoch # ",epoch,"| Batch #", batch, ":", loss)
+
+        model.save_weights("0weights_%d" % epoch)
+
+
+def predict(batch, i, weights):
+    model = full_model()
+    model.load_weights(weights)
+    X, T = get_batch(batch, Y = True)
+    Y= model.predict(X[:i])
+    x = X[i].reshape(m,n)
+    y = Y[i]
+    sub_plot(x, T[i], y)
+
+
+def sketchback(image, weights):
+    model = full_model()
+    model.load_weights(weights)
+    sketch = cv2.imread(image)
+    sketch = imresize(sketch, sketch_dim)
+    sketch = sketch / 255.
+    sketch = sketch.reshape(1,m,n,3)
+    result = model.predict(sketch)
+    imshow(result[0])
+    fig = plt.figure()
+    a = fig.add_subplot(1,2,1)
+    imgplot = plt.imshow(sketch[0].reshape(m,n), cmap='gray')
+    a.set_title('Sketch')
+    plt.axis("off")
+    a = fig.add_subplot(1,2,2)
+    imgplot = plt.imshow(result[0])
+    a.set_title('Prediction')
+    plt.axis("off")
+    plt.show()
+
+def test(image, weights, save_name):
+    model = full_model()
+    model.load_weights(weights)
+    sketch = cv2.imread(image)
+    sketch = imresize(sketch, sketch_dim)
+    sketch = sketch / 255.
+    sketch = sketch.reshape(1,m,n,3)
+    result = model.predict(sketch)
+    print(np.max(result[0]))
+    print(np.min(result[0]))
+    cv2.imwrite(save_name, result[0]*255)
+
+if __name__ == "__main__":
+    train_faces()
+    test("datasets/full_test/A/20_0134_s048.png", "0weights_0", "test_filter.png")
